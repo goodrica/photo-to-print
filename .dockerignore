@@ -1,0 +1,13 @@
+.git
+.gitignore
+.hermes
+demo_output
+*.pyc
+__pycache__
+.env
+.venv
+venv
+*.md
+tests
+demo.py
+.DS_Store
