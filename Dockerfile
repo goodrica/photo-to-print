@@ -1,6 +1,6 @@
-FROM python:3.11-slim
+FROM continuumio/miniconda3:latest
 
-# Install system dependencies for OpenCV and CadQuery
+# Install system dependencies for OpenCV
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
@@ -13,11 +13,20 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+# Install cadquery via conda (brings OCCT native libs)
+RUN conda install -c conda-forge -c cadquery cadquery=2.3.1 -y \
+    && conda clean -afy
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy requirements and install remaining pip deps (excluding cadquery)
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    fastapi==0.109.0 \
+    "uvicorn[standard]==0.27.0" \
+    python-multipart==0.0.6 \
+    "opencv-python-headless==4.9.0.80" \
+    "numpy==1.26.3" \
+    "Pillow==10.2.0" \
+    "pydantic==2.5.3"
 
 # Copy application code
 COPY . .
