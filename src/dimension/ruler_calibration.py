@@ -31,13 +31,16 @@ def detect_ruler(
     """
     Detect a ruler's tick marks and compute pixels-per-mm.
 
-    Strategy:
-      1. Grayscale + adaptive threshold to isolate dark tick marks on a light ruler.
-      2. Find the dominant straight edge (the ruler body) with HoughLinesP.
-      3. Project detected tick contours onto the ruler axis, giving 1-D positions.
-      4. Compute the spacing between adjacent ticks; the robust (median) spacing
+    Strategy (projection-profile, robust to ticks touching the ruler edge):
+      1. Grayscale + adaptive threshold to isolate dark marks on a light ruler.
+      2. Find the dominant straight edge (the ruler body) with HoughLinesP to
+         get the ruler's orientation.
+      3. Rotate the thresholded image so the ruler axis is horizontal.
+      4. Collapse to a 1-D profile by summing ink per column; ruler ticks show
+         up as periodic peaks.
+      5. The dominant spatial frequency of that profile (via autocorrelation)
          is the pixel distance of one tick pitch.
-      5. pixels_per_mm = median_tick_spacing_px / tick_pitch_mm.
+      6. pixels_per_mm = tick_spacing_px / tick_pitch_mm.
 
     Args:
         image: Input image (BGR or grayscale).
@@ -60,7 +63,7 @@ def detect_ruler(
         C=5,
     )
 
-    # Find the dominant straight edge = the ruler axis.
+    # Find the dominant straight edge = the ruler axis, to get orientation.
     edges = cv2.Canny(gray, 50, 150, apertureSize=3)
     segments = cv2.HoughLinesP(
         edges, rho=1, theta=np.pi / 180,
@@ -74,56 +77,60 @@ def detect_ruler(
         (s[0] for s in segments),
         key=lambda s: (s[2] - s[0]) ** 2 + (s[3] - s[1]) ** 2,
     )
-    axis_angle = np.arctan2(y2 - y1, x2 - x1)
-    cos_a, sin_a = np.cos(axis_angle), np.sin(axis_angle)
+    axis_angle_deg = np.degrees(np.arctan2(y2 - y1, x2 - x1))
 
-    # Tick contours.
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    # Rotate so the ruler axis is horizontal, then profile columns.
+    h, w = thresh.shape
+    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), axis_angle_deg, 1.0)
+    rotated = cv2.warpAffine(thresh, M, (w, h), flags=cv2.INTER_NEAREST)
+
+    # Column ink profile: periodic peaks = ticks.
+    profile = rotated.sum(axis=0).astype(np.float64)
+    if profile.max() <= 0:
         return None
+    profile -= profile.mean()
 
-    # Project each small, tick-shaped contour's centroid onto the ruler axis.
-    positions = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < 2 or area > gray.size * 0.02:  # skip noise and large blobs
-            continue
-        M = cv2.moments(c)
-        if M["m00"] == 0:
-            continue
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
-        # Signed distance along the axis direction.
-        positions.append(cx * cos_a + cy * sin_a)
-
-    if len(positions) < 5:
+    # Autocorrelation to find the dominant period (tick spacing in px).
+    ac = np.correlate(profile, profile, mode="full")[len(profile) - 1:]
+    if ac[0] <= 0:
         return None
+    ac = ac / ac[0]
 
-    positions.sort()
-    spacings = np.diff(positions)
-    # Keep only plausible tick spacings (drop zeros/dupes and huge gaps).
-    spacings = spacings[spacings > 1.0]
-    if len(spacings) < 4:
+    # Search a plausible tick-spacing range in pixels.
+    min_lag = 4
+    max_lag = min(len(ac) - 1, max(min_lag + 1, w // 4))
+    if max_lag <= min_lag:
         return None
+    search = ac[min_lag:max_lag]
 
-    median_spacing = float(np.median(spacings))
-    # Robust inlier set near the median.
-    inliers = spacings[np.abs(spacings - median_spacing) < 0.35 * median_spacing]
-    if len(inliers) < 4:
-        return None
+    # First strong local maximum = fundamental tick period.
+    peak_lag = None
+    for i in range(1, len(search) - 1):
+        if search[i] > search[i - 1] and search[i] >= search[i + 1] and search[i] > 0.2:
+            peak_lag = i + min_lag
+            break
+    if peak_lag is None:
+        peak_lag = int(np.argmax(search)) + min_lag
+        if search[peak_lag - min_lag] <= 0.15:
+            return None
 
-    tick_px = float(np.mean(inliers))
+    tick_px = float(peak_lag)
     pixels_per_mm = tick_px / tick_pitch_mm
 
-    # Confidence from spacing consistency and how many ticks agreed.
-    consistency = max(0.0, 1.0 - (float(np.std(inliers)) / tick_px))
-    coverage = min(1.0, len(inliers) / 20.0)
-    confidence = round(0.6 * consistency + 0.4 * coverage, 3)
+    # Confidence: autocorrelation strength at the detected period, and how many
+    # full periods fit across the ruler (more periods = more reliable).
+    ac_strength = float(np.clip(ac[peak_lag], 0.0, 1.0))
+    periods = w / tick_px if tick_px > 0 else 0
+    coverage = float(np.clip(periods / 30.0, 0.0, 1.0))
+    confidence = round(0.65 * ac_strength + 0.35 * coverage, 3)
+
+    if confidence < 0.15:
+        return None
 
     return ScaleCalibration(
         pixels_per_mm=pixels_per_mm,
         confidence=confidence,
-        line_count=len(inliers) + 1,
+        line_count=int(periods) + 1,
         avg_line_spacing_px=tick_px,
     )
 
