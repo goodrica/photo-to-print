@@ -1,5 +1,3 @@
-const { ipcRenderer } = require('electron');
-
 const dropZone = document.getElementById('dropZone');
 const statusEl = document.getElementById('status');
 const resultEl = document.getElementById('result');
@@ -8,6 +6,17 @@ const downloadBtn = document.getElementById('downloadBtn');
 
 let currentJobId = null;
 let currentFilename = null;
+let dragCounter = 0;
+
+const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB
+const ALLOWED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'bmp'];
+
+// HTML escape to prevent XSS
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
 
 // Prevent default drag behaviors
 ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
@@ -20,34 +29,59 @@ function preventDefaults(e) {
   e.stopPropagation();
 }
 
-// Highlight drop zone
-['dragenter', 'dragover'].forEach(eventName => {
-  dropZone.addEventListener(eventName, () => {
-    dropZone.classList.add('drag-over');
-  }, false);
+// Highlight drop zone with counter to prevent flicker
+dropZone.addEventListener('dragenter', () => {
+  dragCounter++;
+  dropZone.classList.add('drag-over');
 });
 
-['dragleave', 'drop'].forEach(eventName => {
-  dropZone.addEventListener(eventName, () => {
+dropZone.addEventListener('dragleave', () => {
+  dragCounter--;
+  if (dragCounter === 0) {
     dropZone.classList.remove('drag-over');
-  }, false);
+  }
+});
+
+dropZone.addEventListener('drop', () => {
+  dragCounter = 0;
+  dropZone.classList.remove('drag-over');
 });
 
 // Handle dropped files
 dropZone.addEventListener('drop', (e) => {
   const files = e.dataTransfer.files;
   if (files.length > 0) {
-    handleFile(files[0]);
+    const file = files[0];
+    
+    // Validate file type
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (!ALLOWED_EXTENSIONS.includes(ext)) {
+      showStatus('error', 'Please drop an image file (JPG, PNG, GIF, BMP)');
+      return;
+    }
+    
+    // Validate file size
+    if (file.size > MAX_FILE_SIZE) {
+      showStatus('error', 'File too large (max 20MB)');
+      return;
+    }
+    
+    // Electron provides file.path for local file access
+    if (!file.path) {
+      showStatus('error', 'Could not read file path');
+      return;
+    }
+    
+    handleFile(file.path);
   }
 });
 
 // Click to browse
 dropZone.addEventListener('click', async () => {
-  const { dialog } = require('electron').remote;
-  const result = await dialog.showOpenDialog({
+  const result = await window.api.showOpenDialog({
     properties: ['openFile'],
     filters: [
-      { name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'bmp'] }
+      { name: 'Images', extensions: ALLOWED_EXTENSIONS }
     ]
   });
   
@@ -60,13 +94,20 @@ async function handleFile(filePath) {
   showStatus('processing', 'Uploading and processing...');
   resultEl.classList.remove('show');
   
-  const result = await ipcRenderer.invoke('upload-photo', filePath);
+  const result = await window.api.uploadPhoto(filePath);
   
   if (result.success) {
+    // Validate response shape
+    if (!result.data || !result.data.job_id) {
+      showStatus('error', 'Unexpected server response');
+      return;
+    }
+    
     currentJobId = result.data.job_id;
     currentFilename = result.data.filename || 'model.stl';
     
-    showStatus('success', `✓ Generated ${result.data.parts_count} part(s)`);
+    const partsCount = result.data.parts_count || (result.data.parts ? result.data.parts.length : 0);
+    showStatus('success', `✓ Generated ${partsCount} part(s)`);
     showResult(result.data);
   } else {
     showStatus('error', `✗ Error: ${result.error}`);
@@ -76,18 +117,26 @@ async function handleFile(filePath) {
 function showStatus(type, message) {
   statusEl.className = `status show ${type}`;
   statusEl.innerHTML = type === 'processing' 
-    ? `<span class="spinner"></span>${message}`
-    : message;
+    ? `<span class="spinner"></span>${escapeHtml(message)}`
+    : escapeHtml(message);
 }
 
 function showResult(data) {
-  const partsList = data.parts.map(p => 
-    `<li><strong>${p.name}</strong> (${p.category}) - ${p.params.width}×${p.params.height}×${p.params.depth}mm</li>`
-  ).join('');
+  const parts = Array.isArray(data.parts) ? data.parts : [];
+  const partsCount = data.parts_count || parts.length;
+  
+  const partsList = parts.map(p => {
+    const name = escapeHtml(p.name || 'Unknown');
+    const category = escapeHtml(p.category || 'Unknown');
+    const width = p.params && p.params.width ? p.params.width.toFixed(1) : '?';
+    const height = p.params && p.params.height ? p.params.height.toFixed(1) : '?';
+    const depth = p.params && p.params.depth ? p.params.depth.toFixed(1) : '?';
+    return `<li><strong>${name}</strong> (${category}) - ${width}×${height}×${depth}mm</li>`;
+  }).join('');
   
   resultInfo.innerHTML = `
-    <p><strong>Job ID:</strong> ${data.job_id}</p>
-    <p><strong>Parts generated:</strong> ${data.parts_count}</p>
+    <p><strong>Job ID:</strong> ${escapeHtml(data.job_id)}</p>
+    <p><strong>Parts generated:</strong> ${partsCount}</p>
     <ul style="margin-top: 10px; padding-left: 20px;">
       ${partsList}
     </ul>
@@ -101,15 +150,15 @@ downloadBtn.addEventListener('click', async () => {
   downloadBtn.disabled = true;
   downloadBtn.innerHTML = '<span class="spinner"></span>Downloading...';
   
-  const result = await ipcRenderer.invoke('download-stl', {
+  const result = await window.api.downloadStl({
     jobId: currentJobId,
     filename: currentFilename
   });
   
   if (result.success) {
-    showStatus('success', `✓ Downloaded to ${result.path}`);
+    showStatus('success', `✓ Downloaded to ${escapeHtml(result.path)}`);
   } else {
-    showStatus('error', `✗ Download failed: ${result.error}`);
+    showStatus('error', `✗ Download failed: ${escapeHtml(result.error)}`);
   }
   
   downloadBtn.disabled = false;

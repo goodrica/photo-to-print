@@ -14,16 +14,13 @@ function createWindow() {
     width: 800,
     height: 600,
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false
-    },
-    icon: path.join(__dirname, 'icon.png')
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js')
+    }
   });
 
   mainWindow.loadFile('index.html');
-  
-  // Enable drag and drop
-  mainWindow.webContents.on('will-navigate', (e) => e.preventDefault());
 }
 
 app.whenReady().then(createWindow);
@@ -38,10 +35,9 @@ ipcMain.handle('upload-photo', async (event, filePath) => {
     const formData = new FormData();
     formData.append('file', fs.createReadStream(filePath));
     
-    // Send to API
     const response = await axios.post(`${API_URL}/api/upload`, formData, {
       headers: formData.getHeaders(),
-      timeout: 120000 // 2 minute timeout for processing
+      timeout: 120000
     });
     
     return {
@@ -56,9 +52,19 @@ ipcMain.handle('upload-photo', async (event, filePath) => {
   }
 });
 
+// Handle file dialog
+ipcMain.handle('show-open-dialog', async (event, options) => {
+  return await dialog.showOpenDialog(mainWindow, options);
+});
+
 // Handle STL download
 ipcMain.handle('download-stl', async (event, { jobId, filename }) => {
   try {
+    // Validate jobId
+    if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+      return { success: false, error: 'Invalid job ID' };
+    }
+    
     const { filePath } = await dialog.showSaveDialog(mainWindow, {
       defaultPath: filename,
       filters: [
@@ -71,11 +77,14 @@ ipcMain.handle('download-stl', async (event, { jobId, filename }) => {
       return { success: false, error: 'Download cancelled' };
     }
     
-    // Download from API
-    const response = await axios.get(`${API_URL}/api/download/${jobId}`, {
+    const response = await axios.get(`${API_URL}/api/download/${encodeURIComponent(jobId)}`, {
       responseType: 'stream',
       timeout: 60000
     });
+    
+    if (response.status !== 200) {
+      return { success: false, error: 'Server returned status ' + response.status };
+    }
     
     const writer = fs.createWriteStream(filePath);
     response.data.pipe(writer);
@@ -83,6 +92,10 @@ ipcMain.handle('download-stl', async (event, { jobId, filename }) => {
     return new Promise((resolve) => {
       writer.on('finish', () => resolve({ success: true, path: filePath }));
       writer.on('error', (err) => resolve({ success: false, error: err.message }));
+      response.data.on('error', (err) => {
+        writer.destroy();
+        resolve({ success: false, error: err.message });
+      });
     });
   } catch (error) {
     return {
@@ -90,9 +103,4 @@ ipcMain.handle('download-stl', async (event, { jobId, filename }) => {
       error: error.message
     };
   }
-});
-
-// Handle file drop
-ipcMain.on('file-drop', (event, filePaths) => {
-  mainWindow.webContents.send('files-dropped', filePaths);
 });
